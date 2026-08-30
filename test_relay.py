@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import os
 import shutil
@@ -79,7 +80,17 @@ def run_tests():
         assert resp.headers.get("X-ClassRelay-Cache") == "HIT"
     print("  -> NPM Proxy & Cache OK")
 
-    print("[6] Test CONNECT Tunneling Proxy...")
+    print("[6] Test Docker Hub Mirror Endpoint...")
+    docker_v2_url = f"{base_url}/v2/"
+    try:
+        urllib.request.urlopen(docker_v2_url)
+    except urllib.error.HTTPError as e:
+        # Docker Registry v2 standard returns 401 Unauthorized with Www-Authenticate header
+        assert e.code == 401
+        assert "Bearer" in e.headers.get("www-authenticate", "") or "realm" in e.headers.get("www-authenticate", "")
+    print("  -> Docker Hub Proxy Endpoint OK")
+
+    print("[7] Test CONNECT Tunneling Proxy...")
     # Test raw CONNECT handshake
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(("127.0.0.1", TEST_PORT))

@@ -12,6 +12,7 @@
 - **多协议全支持**：
   - **PyPI / pip 镜像**：提供 `/pypi/` 镜像端点，自动中继国内清华等高速镜像源。
   - **NPM Registry 镜像**：提供 `/npm/` 镜像端点，中继 npmmirror 镜像源。
+  - **Docker Hub 镜像加速**：提供 `/v2/` 镜像端点，中继 Docker Registry 镜像源。
   - **嵌入式/通用开发工具链**：支持 PlatformIO、Espressif 等工具链资产中继与 HTTP/HTTPS CONNECT 正向代理隧道。
 - **本地高效持久化缓存**：同一个包只要一位同学拉取过一次，教师机自动落盘缓存，其余所有同学直接局域网秒级下载（节约教师机出口带宽）。
 - **学生机一键配置 / 一键还原**：
@@ -82,6 +83,15 @@ chmod +x start.sh
   npm config set registry http://192.168.1.100:8080/npm/
   npm config set strict-ssl false
   ```
+- **Docker Hub (容器镜像加速)**:
+  在学生机 `/etc/docker/daemon.json`（或 Docker Desktop 设置）中添加：
+  ```json
+  {
+    "registry-mirrors": ["http://192.168.1.100:8080"],
+    "insecure-registries": ["192.168.1.100:8080"]
+  }
+  ```
+  然后重启 Docker 服务：`sudo systemctl restart docker`。
 - **PlatformIO / ESP32 / STM32 (终端代理)**:
   ```bash
   # Windows PowerShell

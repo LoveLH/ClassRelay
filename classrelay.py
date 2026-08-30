@@ -30,6 +30,7 @@ VERSION = "1.0.0"
 UPSTREAMS = {
     "pypi": "https://pypi.tuna.tsinghua.edu.cn/simple",
     "npm": "https://registry.npmmirror.com",
+    "docker": "https://docker.m.daocloud.io",
     "platformio": "https://api.registry.platformio.org",
     "github_raw": "https://raw.githubusercontent.com",
     "espressif": "https://dl.espressif.com",
@@ -208,12 +209,18 @@ class ClassRelayHandler(http.server.BaseHTTPRequestHandler):
             self._serve_setup_script(path)
             return
 
-        # 5. Mirror routes: /pypi/, /npm/, /platformio/, /espressif/
+        # 5. Mirror routes: /pypi/, /npm/, /v2/ (Docker Registry v2), /platformio/, /espressif/
         if path.startswith("/pypi/"):
             self._proxy_mirror(path[len("/pypi"):], UPSTREAMS["pypi"], "pypi")
             return
         elif path.startswith("/npm/"):
             self._proxy_mirror(path[len("/npm"):], UPSTREAMS["npm"], "npm")
+            return
+        elif path.startswith("/v2/") or path == "/v2":
+            self._proxy_mirror(path, UPSTREAMS["docker"], "docker")
+            return
+        elif path.startswith("/docker/"):
+            self._proxy_mirror(path[len("/docker"):], UPSTREAMS["docker"], "docker")
             return
         elif path.startswith("/platformio/"):
             self._proxy_mirror(path[len("/platformio"):], UPSTREAMS["platformio"], "platformio")
@@ -314,6 +321,15 @@ pip config set global.trusted-host {display_ip}</code></pre>
             <p style="font-size: 13px; color: #94a3b8;">指定教师机作为 npm Registry：</p>
             <pre><code>npm config set registry http://{display_ip}:{port}/npm/
 npm config set strict-ssl false</code></pre>
+        </div>
+
+        <div class="card">
+            <h3>Docker / 镜像加速配置</h3>
+            <p style="font-size: 13px; color: #94a3b8;">将教师机配置为 Docker Registry Mirror (/etc/docker/daemon.json)：</p>
+            <pre><code>{{
+  "registry-mirrors": ["http://{display_ip}:{port}"],
+  "insecure-registries": ["{display_ip}:{port}"]
+}}</code></pre>
         </div>
 
         <div class="card">
@@ -512,6 +528,9 @@ echo ">>> [SUCCESS] Defaults restored."
         except urllib.error.HTTPError as e:
             try:
                 self.send_response(e.code)
+                for k, v in dict(e.headers).items():
+                    if k.lower() not in ["transfer-encoding", "content-length"]:
+                        self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(e.read())
             except (BrokenPipeError, ConnectionResetError):
@@ -582,6 +601,7 @@ def main():
     print(f"  Web 控制台与配置入口:  http://{ips[0]}:{args.port}/")
     print(f"  PyPI 镜像中继:        http://{ips[0]}:{args.port}/pypi/")
     print(f"  NPM 镜像中继:         http://{ips[0]}:{args.port}/npm/")
+    print(f"  Docker Hub 镜像中继:  http://{ips[0]}:{args.port}/v2/")
     print(f"  PlatformIO 镜像中继:  http://{ips[0]}:{args.port}/platformio/")
     print(f"  HTTP/HTTPS 代理隧道:  http://{ips[0]}:{args.port}")
     print(f"  本地缓存目录:          {args.cache_dir}")
