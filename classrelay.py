@@ -581,6 +581,7 @@ echo ">>> [SUCCESS] Defaults restored."
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
     def __init__(self, server_address, RequestHandlerClass, cache_dir: str):
         super().__init__(server_address, RequestHandlerClass)
@@ -612,7 +613,20 @@ def main():
     print(f"    curl -fsSL http://{ips[0]}:{args.port}/setup/bash | bash")
     print("=" * 60)
 
-    server = ThreadedHTTPServer((args.host, args.port), ClassRelayHandler, cache_dir=args.cache_dir)
+    try:
+        server = ThreadedHTTPServer((args.host, args.port), ClassRelayHandler, cache_dir=args.cache_dir)
+    except OSError as e:
+        print(f"\n[错误] 无法监听 {args.host}:{args.port} —— {e}")
+        if "in use" in str(e).lower() or e.errno in (98, 10048):
+            print("      端口已被其他程序占用（常见：上次未完全退出、Tomcat / 其他代理软件占用了 8080）。")
+            print("      解决办法二选一：")
+            print(f"        1) 换一个端口启动：python classrelay.py --port 8081")
+            print(f"        2) 关闭占用 {args.port} 端口的程序后重试。")
+            print("      提示：本服务已开启地址复用，关闭后通常需等待几十秒才能重新绑定。")
+        else:
+            print("      请检查端口是否被防火墙/权限限制，或改用其他端口：python classrelay.py --port 8081")
+        sys.exit(1)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
