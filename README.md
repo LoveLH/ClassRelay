@@ -129,13 +129,49 @@ chmod +x start.sh
 
 ```text
 usage: classrelay.py [-h] [--port PORT] [--host HOST] [--cache-dir CACHE_DIR]
+                     [--auth-token AUTH_TOKEN] [--max-cache-mb MAX_CACHE_MB]
 
 选项:
-  -h, --help            显示帮助信息
-  --port PORT, -p PORT  监听端口 (默认: 8080)
-  --host HOST, -H HOST  监听地址 (默认: 0.0.0.0 全局绑定)
-  --cache-dir CACHE_DIR 本地缓存路径 (默认: ~/.classrelay/cache)
+  -h, --help                 显示帮助信息
+  --port PORT, -p PORT       监听端口 (默认: 8080)
+  --host HOST, -H HOST       监听地址 (默认: 0.0.0.0 全局绑定)
+  --cache-dir CACHE_DIR      本地缓存路径 (默认: ~/.classrelay/cache)
+  --auth-token AUTH_TOKEN    可选：代理/镜像访问密码（默认关闭，见下方安全说明）
+  --max-cache-mb N           缓存目录上限 (MB)，超过按最旧优先清理 (默认 200)
 ```
+
+### 🔐 安全说明：开放代理的暴露风险
+
+ClassRelay 默认监听 `0.0.0.0`，也就是**局域网内任何一台设备都能借用这台教师机的出口带宽**。
+校园网 / 机房场景下这通常是预期的，但如果教师机所在网段不完全可控（例如接了访客 Wi-Fi），
+建议显式加口令：
+
+```bash
+python classrelay.py --auth-token "你的口令"
+```
+
+启用后：
+- **镜像端点**（`/pypi/`、`/npm/`、`/v2/`、`/platformio/`、`/espressif/`）与 **HTTP 正向代理** 需要携带口令；
+- 携带方式二选一：
+  - URL 查询参数：`http://<教师机IP>:8080/pypi/?token=你的口令`（pip: `--index-url` 带 `?token=`）
+  - 请求头：`X-ClassRelay-Token: 你的口令`
+- 不带口令请求会收到 `407 Proxy Authentication Required`；
+- Web 控制台（`/`）、一键配置脚本（`/setup/*`）、状态 API（`/api/status`）**不校验口令**，
+  方便同学自助配置。
+
+> 更严格的收紧方式：`--host 127.0.0.1`（仅本机，配合本机转发）或在系统防火墙里只放行机房网段。
+
+---
+
+## 📦 缓存策略
+
+- **索引 / 元数据类**（PyPI simple index、npm packument、Docker `/v2/` 目录等）：短 TTL（默认 10 分钟），
+  上游发新版本后学生机能在 10 分钟内看到，不会永久锁定在旧索引上。
+- **包文件 / tarball 等静态资源**：长 TTL（默认 7 天），够覆盖整节课乃至一周。
+- **容量上限**：缓存目录超过 `--max-cache-mb`（默认 200 MB）时，按文件 mtime 由旧到新自动淘汰，
+  避免长期占用教师机磁盘。
+
+响应头 `X-ClassRelay-Cache: HIT / MISS` 可用于确认是否命中教师机缓存。
 
 ---
 
