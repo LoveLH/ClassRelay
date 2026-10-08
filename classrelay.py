@@ -20,13 +20,14 @@ import os
 import sys
 import argparse
 import hashlib
+import re
 from typing import Tuple, Optional, Dict, Any
 
 DEFAULT_PORT = 8080
 DEFAULT_CACHE_DIR = os.path.expanduser("~/.classrelay/cache")
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
-# Default upstream mappings
+# 上游镜像站默认映射
 UPSTREAMS = {
     "pypi": "https://pypi.tuna.tsinghua.edu.cn/simple",
     "npm": "https://registry.npmmirror.com",
@@ -41,7 +42,7 @@ def get_local_ips():
     """Retrieve non-loopback local IPv4 addresses."""
     ips = []
     try:
-        # Connect to public DNS address without sending data
+        # 连接公网 DNS 地址以探测本机出口 IP（不实际发数据）
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("223.5.5.5", 80))
         primary_ip = s.getsockname()[0]
@@ -64,10 +65,18 @@ def get_local_ips():
 
 
 class CacheManager:
-    """Disk-backed caching layer for requested HTTP assets."""
+    """磁盘缓存层，带 TTL 与上限清理，避免无限增长。"""
 
-    def __init__(self, cache_dir: str):
+    # index 类响应（simple index / docker v2 / npm registry 元数据）TTL 较短：上游发版即可看到
+    INDEX_TTL_SECONDS = 600  # 10 分钟
+    # 包文件 / tarball 等静态资源 TTL 较长（覆盖整节课足够长）
+    ASSET_TTL_SECONDS = 7 * 24 * 3600  # 7 天
+    # 缓存总字节上限（默认 ~200 MB）；超过则按 mtime 优先清理
+    DEFAULT_MAX_BYTES = 200 * 1024 * 1024
+
+    def __init__(self, cache_dir: str, max_bytes: Optional[int] = None):
         self.cache_dir = cache_dir
+        self.max_bytes = max_bytes if max_bytes is not None else self.DEFAULT_MAX_BYTES
         os.makedirs(os.path.join(cache_dir, "meta"), exist_ok=True)
         os.makedirs(os.path.join(cache_dir, "data"), exist_ok=True)
         self.stats = {
@@ -93,6 +102,22 @@ class CacheManager:
     def _url_to_hash(self, url: str) -> str:
         return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _classify(url: str, headers: Dict[str, str]) -> str:
+        """根据 URL / 响应头粗略判断是否属于 index 类（短 TTL），否则按静态资源（长 TTL）。"""
+        ct = headers.get("Content-Type", "")
+        path = urllib.parse.urlparse(url).path
+        # 文本 / HTML / JSON 都视为索引/元数据，TTL 短
+        if "text/html" in ct or "application/json" in ct or "text/plain" in ct:
+            return "index"
+        # docker registry /v2/ 根路径永远 401，也是元数据
+        if path.startswith("/v2/"):
+            return "index"
+        return "asset"
+
+    def _ttl_for(self, kind: str) -> int:
+        return self.INDEX_TTL_SECONDS if kind == "index" else self.ASSET_TTL_SECONDS
+
     def get(self, url: str) -> Optional[Tuple[bytes, Dict[str, str], int]]:
         url_hash = self._url_to_hash(url)
         data_path = os.path.join(self.cache_dir, "data", url_hash)
@@ -102,6 +127,14 @@ class CacheManager:
             try:
                 with open(meta_path, "r", encoding="utf-8") as f:
                     meta = json.load(f)
+                kind = meta.get("kind", "asset")
+                ttl = self._ttl_for(kind)
+                ts = float(meta.get("timestamp", 0))
+                if ttl > 0 and (time.time() - ts) > ttl:
+                    # 过期则忽略缓存条目（视为 MISS，但不删除，惰性过期）
+                    with self.lock:
+                        self.stats["misses"] += 1
+                    return None
                 with open(data_path, "rb") as f:
                     data = f.read()
                 with self.lock:
@@ -114,37 +147,161 @@ class CacheManager:
             self.stats["misses"] += 1
         return None
 
+    def _enforce_size_limit(self):
+        """若缓存总量超过 max_bytes，按 mtime 升序删除最旧条目直至达标。"""
+        try:
+            data_dir = os.path.join(self.cache_dir, "data")
+            total = 0
+            entries = []
+            for entry in os.scandir(data_dir):
+                if entry.is_file():
+                    st = entry.stat()
+                    entries.append((st.st_mtime, entry.path, st.st_size))
+                    total += st.st_size
+            if total <= self.max_bytes or not entries:
+                return
+            # 最旧优先淘汰
+            entries.sort()
+            for mt, path, sz in entries:
+                if total <= self.max_bytes:
+                    break
+                try:
+                    os.remove(path)
+                    url_hash = os.path.basename(path)
+                    meta_path = os.path.join(self.cache_dir, "meta", url_hash + ".json")
+                    if os.path.exists(meta_path):
+                        os.remove(meta_path)
+                    total -= sz
+                except Exception:
+                    continue
+            with self.lock:
+                self.stats["cached_bytes"] = total
+        except Exception:
+            pass
+
     def put(self, url: str, data: bytes, headers: Dict[str, str], status: int = 200):
-        # Cache successful GET payloads only
+        # 仅缓存成功的 GET 响应体
         if status != 200 or len(data) == 0:
             return
         url_hash = self._url_to_hash(url)
+        kind = self._classify(url, headers)
         data_path = os.path.join(self.cache_dir, "data", url_hash)
         meta_path = os.path.join(self.cache_dir, "meta", url_hash + ".json")
 
         try:
-            # ponytail: in-memory string headers; sufficient for standard pip/npm packages
             clean_headers = {
                 k: v for k, v in headers.items() if k.lower() not in ["transfer-encoding", "connection"]
             }
             with open(data_path, "wb") as f:
                 f.write(data)
             with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump({"url": url, "headers": clean_headers, "status": status, "timestamp": time.time()}, f)
+                json.dump({
+                    "url": url,
+                    "headers": clean_headers,
+                    "status": status,
+                    "timestamp": time.time(),
+                    "kind": kind,
+                }, f)
             with self.lock:
                 self.stats["cached_bytes"] += len(data)
+            # 写入后做一次容量控制，避免无限增长
+            self._enforce_size_limit()
         except Exception as e:
             sys.stderr.write(f"[Cache Error] Failed to write cache: {e}\n")
 
 
+# PyPI simple index 中的包文件链接默认为相对路径 "../../packages/..."，pip 解析后会请求教师机的 /packages/*，
+# 而 ClassRelay 没有该路由。需要把 href 重写为教师机可缓存的 /pypi/packages/*。
+_PYPI_HREF_RE = re.compile(r'href="([^"]+)"')
+
+
+def _rewrite_pypi_simple_index(html_text: str) -> Optional[str]:
+    """重写 PyPI simple index HTML 中的 href，使其指向教师机 /pypi/ 镜像。
+
+    返回处理后的 HTML；解析失败返回 None。
+    """
+    def _rewrite(match: "re.Match[str]") -> str:
+        href = match.group(1)
+        # 已是绝对 URL：仅当指向已知上游 simple 域名时改写，否则保留避免破坏上游直链场景
+        if href.startswith("http://") or href.startswith("https://"):
+            for upstream_host in ("pypi.tuna.tsinghua.edu.cn", "pypi.org", "files.pythonhosted.org"):
+                if upstream_host in href:
+                    # 抽出 path 段（去掉 fragment）
+                    parsed = urllib.parse.urlparse(href)
+                    new_path = parsed.path
+                    return f'href="/pypi{new_path}"'
+            return match.group(0)
+        # 相对路径：把常见的 ../../packages/xx/yy/<pkg> 改成 /pypi/packages/xx/yy/<pkg>
+        # fragment (#sha256=...) 由客户端自行丢弃，这里保留也可。
+        if href.startswith("../../"):
+            tail = href[6:]  # 去掉 "../.."
+        elif href.startswith("./"):
+            tail = href[2:]
+        elif href.startswith("/"):
+            return match.group(0)  # 已是绝对路径但属上游站外，无需改写
+        else:
+            tail = href
+        return f'href="/pypi/{tail}"'
+
+    new_html, count = _PYPI_HREF_RE.subn(_rewrite, html_text)
+    if count == 0:
+        return None
+    return new_html
+
+
+def _rewrite_npm_packument(payload: Any) -> Optional[Dict[str, Any]]:
+    """把 npm packument 中所有 dist.tarball 重写为教师机 /npm/ 镜像 URL，确保包文件走缓存。"""
+    changed = False
+
+    def _rewrite_url(url: Any) -> Any:
+        nonlocal changed
+        if not isinstance(url, str):
+            return url
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return url
+        # 抽出 path，把上游 tarball URL（形如 .../vue/-/vue-1.2.3.tgz）改成 /npm/vue/-/vue-1.2.3.tgz
+        parsed = urllib.parse.urlparse(url)
+        new_url = f"/npm{parsed.path}"
+        changed = True
+        return new_url
+
+    if isinstance(payload, dict):
+        dist = payload.get("dist")
+        if isinstance(dist, dict) and isinstance(dist.get("tarball"), str):
+            new_tar = _rewrite_url(dist["tarball"])
+            if new_tar != dist["tarball"]:
+                dist["tarball"] = new_tar
+                changed = True
+        versions = payload.get("versions")
+        if isinstance(versions, dict):
+            for ver_data in versions.values():
+                if isinstance(ver_data, dict):
+                    d = ver_data.get("dist")
+                    if isinstance(d, dict) and isinstance(d.get("tarball"), str):
+                        new_tar = _rewrite_url(d["tarball"])
+                        if new_tar != d["tarball"]:
+                            d["tarball"] = new_tar
+                            changed = True
+    if not changed:
+        return None
+    return payload
+
+
 class ClassRelayHandler(http.server.BaseHTTPRequestHandler):
-    """Handles HTTP CONNECT proxy, REST mirror endpoints, Web UI and client scripts."""
+    """处理 HTTP CONNECT 代理、REST 镜像端点、Web UI 与一键配置脚本。"""
 
     server_version = f"ClassRelay/{VERSION}"
 
+    # 由 ThreadedHTTPServer 通过 auth_token 注入；为空表示不启用认证（默认保持开箱即用）
+    auth_token: Optional[str] = None
+
     def log_message(self, format, *args):
-        # Terse custom logging
-        sys.stdout.write(f"[{self.log_date_time_string()}] {self.client_address[0]} {args[0]} {args[1]} {args[2]}\n")
+        # 简洁访问日志：使用 format % args 安全拼接，避免 send_error 等仅传 2 个参数时触发 IndexError
+        try:
+            message = format % args
+        except Exception:
+            message = format if isinstance(format, str) else str(format)
+        sys.stdout.write(f"[{self.log_date_time_string()}] {self.client_address[0]} {message}\n")
 
     @property
     def cache(self) -> CacheManager:
@@ -152,16 +309,28 @@ class ClassRelayHandler(http.server.BaseHTTPRequestHandler):
 
     def do_CONNECT(self):
         """Standard HTTP forward proxy via CONNECT tunneling (HTTPS)."""
-        # Format: host:port
-        host, port_str = self.path.split(":") if ":" in self.path else (self.path, "443")
-        port = int(port_str)
-
+        # Format: host:port (IPv6 时为 [::1]:port)。host:port 解析放进 try，避免畸形/ValueError 崩线程。
+        target_sock: Optional["socket"] = None
         try:
+            if ":" in self.path and not self.path.startswith("["):
+                host, port_str = self.path.split(":", 1)
+            elif self.path.startswith("[") and "]" in self.path:
+                host_part, rest = self.path[1:].split("]", 1)
+                host = host_part
+                port_str = rest.lstrip(":") or "443"
+            else:
+                host, port_str = (self.path, "443")
+            try:
+                port = int(port_str)
+            except ValueError:
+                self.send_error(502, f"Bad Gateway: invalid CONNECT target {self.path}")
+                return
+
             target_sock = socket.create_connection((host, port), timeout=15)
             self.send_response(200, "Connection Established")
             self.end_headers()
 
-            # Bidirectional pipe between client socket and remote server socket
+            # 客户端 socket 与远端 server socket 之间做双向管道转发
             conns = [self.connection, target_sock]
             self.connection.setblocking(False)
             target_sock.setblocking(False)
@@ -177,24 +346,54 @@ class ClassRelayHandler(http.server.BaseHTTPRequestHandler):
                         return
                     other.sendall(data)
         except Exception as e:
-            self.send_error(502, f"Bad Gateway CONNECT failed: {e}")
-        finally:
             try:
-                target_sock.close()
-            except Exception:
+                self.send_error(502, f"Bad Gateway CONNECT failed: {e}")
+            except (BrokenPipeError, ConnectionResetError):
                 pass
+        finally:
+            if target_sock is not None:
+                try:
+                    target_sock.close()
+                except Exception:
+                    pass
+
+    def _check_auth(self) -> bool:
+        """检查请求是否携带有效 token。若未启用 token（默认）则放行。
+
+        Token 通过查询参数 `?token=xxx` 或请求头 `X-ClassRelay-Token: xxx` 传入。
+        返回 True 表示已认证。
+        """
+        token = self.auth_token
+        if not token:
+            return True
+        # 查询参数
+        try:
+            parsed_q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            for t in parsed_q.get("token", []):
+                if t == token:
+                    return True
+        except Exception:
+            pass
+        # 自定义请求头
+        header_token = self.headers.get("X-ClassRelay-Token", "")
+        if header_token and header_token == token:
+            return True
+        return False
 
     def do_GET(self):
-        """Route to Dashboard, Scripts, Mirrors, or standard forward HTTP proxy."""
-        # 1. Forward proxy handling if path starts with http:// or https://
+        """路由分发：Dashboard / 脚本 / 镜像 / HTTP 正向代理。"""
+        # 1. 正向代理：路径以 http:// 或 https:// 开头
         if self.path.startswith("http://") or self.path.startswith("https://"):
+            if not self._check_auth():
+                self.send_error(407, "Proxy Authentication Required: provide ?token=... or X-ClassRelay-Token header")
+                return
             self._handle_forward_http()
             return
 
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        # 2. Web UI Dashboard
+        # 2. Web 控制台 Dashboard（无需认证：用于让同学扫描/查看代理使用方式）
         if path in ["", "/", "/index.html"]:
             self._serve_dashboard()
             return
@@ -204,38 +403,79 @@ class ClassRelayHandler(http.server.BaseHTTPRequestHandler):
             self._serve_api_status()
             return
 
-        # 4. One-click setup scripts
+        # 4. 一键配置脚本
         if path.startswith("/setup/"):
             self._serve_setup_script(path)
             return
 
-        # 5. Mirror routes: /pypi/, /npm/, /v2/ (Docker Registry v2), /platformio/, /espressif/
-        if path.startswith("/pypi/"):
-            self._proxy_mirror(path[len("/pypi"):], UPSTREAMS["pypi"], "pypi")
-            return
-        elif path.startswith("/npm/"):
-            self._proxy_mirror(path[len("/npm"):], UPSTREAMS["npm"], "npm")
-            return
-        elif path.startswith("/v2/") or path == "/v2":
-            self._proxy_mirror(path, UPSTREAMS["docker"], "docker")
-            return
-        elif path.startswith("/docker/"):
-            self._proxy_mirror(path[len("/docker"):], UPSTREAMS["docker"], "docker")
-            return
-        elif path.startswith("/platformio/"):
-            self._proxy_mirror(path[len("/platformio"):], UPSTREAMS["platformio"], "platformio")
-            return
-        elif path.startswith("/espressif/"):
-            self._proxy_mirror(path[len("/espressif"):], UPSTREAMS["espressif"], "espressif")
-            return
+        # 5. 镜像路由（需要 token 防止被盗用带宽）
+        if path.startswith("/pypi/") or path.startswith("/npm/") or path.startswith("/v2/") or path == "/v2" or path.startswith("/docker/") or path.startswith("/platformio/") or path.startswith("/espressif/"):
+            if not self._check_auth():
+                self.send_error(407, "Proxy Authentication Required: provide ?token=... or X-ClassRelay-Token header")
+                return
+            if path.startswith("/pypi/"):
+                # simple index 与包文件两类上游路径不同：
+                #   /pypi/<package>/         → upstream /simple/<package>/
+                #   /pypi/packages/<...>     → upstream /packages/<...>  （用于 simple 页面相对链接 ../packages/）
+                #   /pypi/simple/<...>       → upstream /simple/<...>    （直接访问 raw source 形式）
+                sub = path[len("/pypi"):]
+                if sub.startswith("/packages/"):
+                    upstream = UPSTREAMS["pypi"].replace("/simple", "") + "/"
+                    self._proxy_mirror(sub, upstream, "pypi")
+                elif sub.startswith("/simple/"):
+                    self._proxy_mirror(sub[len("/simple"):], sub, "pypi")
+                else:
+                    self._proxy_mirror(sub, UPSTREAMS["pypi"], "pypi")
+                return
+            elif path.startswith("/npm/"):
+                self._proxy_mirror(path[len("/npm"):], UPSTREAMS["npm"], "npm")
+                return
+            elif path.startswith("/v2/") or path == "/v2":
+                self._proxy_mirror(path, UPSTREAMS["docker"], "docker")
+                return
+            elif path.startswith("/docker/"):
+                self._proxy_mirror(path[len("/docker"):], UPSTREAMS["docker"], "docker")
+                return
+            elif path.startswith("/platformio/"):
+                self._proxy_mirror(path[len("/platformio"):], UPSTREAMS["platformio"], "platformio")
+                return
+            elif path.startswith("/espressif/"):
+                self._proxy_mirror(path[len("/espressif"):], UPSTREAMS["espressif"], "espressif")
+                return
 
-        # Fallback 404
+        # 兜底 404
         self.send_error(404, "Endpoint not found on ClassRelay")
 
-    def _serve_dashboard(self):
+    def _parse_host_header(self) -> Tuple[str, str]:
+        """解析 Host 头，兼容 IPv6（[::1]:8080）。返回 (server_ip, port)。"""
         host = self.headers.get("Host", f"127.0.0.1:{DEFAULT_PORT}")
-        server_ip = host.split(":")[0]
-        port = host.split(":")[1] if ":" in host else str(DEFAULT_PORT)
+        # 去除 IPv6 方括号前的字面量影响
+        try:
+            if host.startswith("["):
+                # IPv6: [::1]:8080
+                end = host.find("]")
+                if end == -1:
+                    server_ip = host
+                    port = str(DEFAULT_PORT)
+                else:
+                    server_ip = host[: end + 1]
+                    rest = host[end + 1 :]
+                    port = rest.lstrip(":") or str(DEFAULT_PORT)
+            else:
+                # 简单 host:port，使用 rsplit 保证 IPv4 / hostname 正常
+                if ":" in host:
+                    server_ip, _, port = host.rpartition(":")
+                    if not port.isdigit():
+                        port = str(DEFAULT_PORT)
+                else:
+                    server_ip = host
+                    port = str(DEFAULT_PORT)
+        except Exception:
+            server_ip, port = "127.0.0.1", str(DEFAULT_PORT)
+        return server_ip, port
+
+    def _serve_dashboard(self):
+        server_ip, port = self._parse_host_header()
         ips = get_local_ips()
         display_ip = ips[0] if ips else server_ip
 
@@ -387,9 +627,7 @@ git config --global https.proxy http://{display_ip}:{port}</code></pre>
         self.wfile.write(encoded)
 
     def _serve_setup_script(self, path: str):
-        host = self.headers.get("Host", f"127.0.0.1:{DEFAULT_PORT}")
-        server_ip = host.split(":")[0]
-        port = host.split(":")[1] if ":" in host else str(DEFAULT_PORT)
+        server_ip, port = self._parse_host_header()
         ips = get_local_ips()
         target_ip = ips[0] if ips else server_ip
 
@@ -476,7 +714,7 @@ echo ">>> [SUCCESS] Defaults restored."
 
     def _proxy_mirror(self, subpath: str, upstream_base: str, mirror_type: str):
         """Proxy and cache mirror requests to upstream mirrors (PyPI, npm, PlatformIO, etc.)."""
-        # Strip leading slash if present
+        # 去掉子路径开头可能存在的斜杠
         subpath = subpath.lstrip("/")
         upstream_url = f"{upstream_base.rstrip('/')}/{subpath}"
         if self.path.find("?") != -1:
@@ -488,7 +726,10 @@ echo ">>> [SUCCESS] Defaults restored."
         if cached:
             data, headers, status = cached
             self.send_response(status)
+            # 跳过 transfer-encoding / connection / 原始 Content-Length（我们另行 set our own）
             for k, v in headers.items():
+                if k.lower() in ("transfer-encoding", "connection", "content-length"):
+                    continue
                 self.send_header(k, v)
             self.send_header("X-ClassRelay-Cache", "HIT")
             self.send_header("Content-Length", str(len(data)))
@@ -499,7 +740,7 @@ echo ">>> [SUCCESS] Defaults restored."
                 pass
             return
 
-        # Fetch from upstream with teacher machine connection
+        # 用教师机的网络连接去拉取上游
         try:
             req = urllib.request.Request(
                 upstream_url,
@@ -510,10 +751,26 @@ echo ">>> [SUCCESS] Defaults restored."
                 status = resp.getcode()
                 resp_headers = dict(resp.info())
 
-                # If PyPI simple index, rewrite URLs to point to teacher mirror if relative
+                # PyPI simple index 页面需要把包文件 href 重写为教师机可缓存路径，
+                # 否则 pip 会按相对路径解析为 http://<host>/packages/...，该路径无路由 → 404
                 if mirror_type == "pypi" and "text/html" in resp_headers.get("Content-Type", ""):
-                    # Replace relative or direct package URLs to maintain caching
-                    pass
+                    try:
+                        html_text = data.decode("utf-8", errors="replace")
+                        rewritten = _rewrite_pypi_simple_index(html_text)
+                        if rewritten is not None:
+                            data = rewritten.encode("utf-8")
+                    except Exception:
+                        pass
+
+                # NPM packument 需要重写 dist.tarball，确保 npm 拉取的包文件也走教师机缓存
+                if mirror_type == "npm" and "application/json" in resp_headers.get("Content-Type", ""):
+                    try:
+                        payload = json.loads(data.decode("utf-8", errors="replace"))
+                        rewritten_npm = _rewrite_npm_packument(payload)
+                        if rewritten_npm is not None:
+                            data = json.dumps(rewritten_npm).encode("utf-8")
+                    except Exception:
+                        pass
 
                 self.cache.put(upstream_url, data, resp_headers, status)
 
@@ -551,6 +808,8 @@ echo ">>> [SUCCESS] Defaults restored."
             data, headers, status = cached
             self.send_response(status)
             for k, v in headers.items():
+                if k.lower() in ("transfer-encoding", "connection", "content-length"):
+                    continue
                 self.send_header(k, v)
             self.send_header("X-ClassRelay-Cache", "HIT")
             self.send_header("Content-Length", str(len(data)))
@@ -583,9 +842,12 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, RequestHandlerClass, cache_dir: str):
+    def __init__(self, server_address, RequestHandlerClass, cache_dir: str,
+                 auth_token: Optional[str] = None, max_cache_bytes: Optional[int] = None):
         super().__init__(server_address, RequestHandlerClass)
-        self.cache_manager = CacheManager(cache_dir)
+        self.cache_manager = CacheManager(cache_dir, max_bytes=max_cache_bytes)
+        # 将 token 注入 handler 类属性（默认 None 即关闭认证）
+        RequestHandlerClass.auth_token = auth_token
 
 
 def main():
@@ -593,6 +855,11 @@ def main():
     parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT, help=f"监听端口 (默认: {DEFAULT_PORT})")
     parser.add_argument("--host", "-H", type=str, default="0.0.0.0", help="监听地址 (默认: 0.0.0.0 局域网全绑定)")
     parser.add_argument("--cache-dir", "-c", type=str, default=DEFAULT_CACHE_DIR, help="本地缓存目录")
+    parser.add_argument("--auth-token", type=str, default=None,
+                        help="可选：代理/镜像访问密码。开启后需在 pip/npm 中以 ?token=xxx 或 X-ClassRelay-Token 头携带。"
+                             "默认关闭以保持开箱即用。注意：默认 0.0.0.0 绑定会暴露给整个局域网，建议课堂场景显式启用。")
+    parser.add_argument("--max-cache-mb", type=int, default=None,
+                        help=f"缓存目录上限（MB）。超过则按最旧优先清理，默认 {CacheManager.DEFAULT_MAX_BYTES // (1024*1024)} MB。")
     args = parser.parse_args()
 
     ips = get_local_ips()
@@ -614,7 +881,14 @@ def main():
     print("=" * 60)
 
     try:
-        server = ThreadedHTTPServer((args.host, args.port), ClassRelayHandler, cache_dir=args.cache_dir)
+        max_bytes = args.max_cache_mb * 1024 * 1024 if args.max_cache_mb else None
+        server = ThreadedHTTPServer(
+            (args.host, args.port),
+            ClassRelayHandler,
+            cache_dir=args.cache_dir,
+            auth_token=args.auth_token,
+            max_cache_bytes=max_bytes,
+        )
     except OSError as e:
         print(f"\n[错误] 无法监听 {args.host}:{args.port} —— {e}")
         if "in use" in str(e).lower() or e.errno in (98, 10048):
