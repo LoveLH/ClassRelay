@@ -9,4 +9,4 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-python3 classrelay.py "$@"
+python3 -u classrelay.py "$@"

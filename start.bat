@@ -26,7 +26,7 @@ if not defined PYCMD (
 )
 
 echo 使用 Python 命令: %PYCMD%
-%PYCMD% classrelay.py %*
+%PYCMD% -u classrelay.py %*
 if %errorlevel% neq 0 (
     pause
 )
