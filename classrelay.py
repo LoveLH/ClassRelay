@@ -194,6 +194,59 @@ def is_blocked_ip(ip: str) -> bool:
     return any(addr in net for net in nets)
 
 
+def _parse_ipv4_component(text: str) -> Optional[int]:
+    """One inet_aton component: decimal, 0-octal, or 0x-hex. None if it is not a number."""
+    if not text:
+        return None
+    try:
+        if text[:2].lower() == "0x":
+            digits = text[2:]
+            if not digits or any(ch not in "0123456789abcdefABCDEF" for ch in digits):
+                return None
+            return int(text, 16)
+        if text[0] == "0" and len(text) > 1:
+            if any(ch not in "01234567" for ch in text):
+                return None
+            return int(text, 8)
+        if not text.isdigit():
+            return None
+        return int(text, 10)
+    except ValueError:
+        return None
+
+
+def normalize_ipv4_literal(host: str) -> Optional[str]:
+    """Dotted quad for inet_aton forms, or None when host is a name.
+
+    glibc getaddrinfo accepts 2130706433, 0x7f000001, and 127.1 as 127.0.0.1.
+    Windows does not, and a failed lookup used to become 502 instead of 403.
+    """
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+    values: List[int] = []
+    for part in parts:
+        value = _parse_ipv4_component(part)
+        if value is None:
+            return None
+        values.append(value)
+    last_max = (1 << (8 * (5 - len(values)))) - 1
+    if values[-1] > last_max:
+        return None
+    for value in values[:-1]:
+        if value > 0xFF:
+            return None
+    if len(values) == 1:
+        number = values[0]
+    elif len(values) == 2:
+        number = (values[0] << 24) | values[1]
+    elif len(values) == 3:
+        number = (values[0] << 24) | (values[1] << 16) | values[2]
+    else:
+        number = (values[0] << 24) | (values[1] << 16) | (values[2] << 8) | values[3]
+    return ".".join(str((number >> shift) & 0xFF) for shift in (24, 16, 8, 0))
+
+
 def resolve_addresses(host: str, port: int):
     """DNS lookup. Tests monkeypatch this."""
     return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -229,6 +282,11 @@ def resolve_destination(host: str, port: int, *, private_ok: bool):
     """
     if not host or len(host) > 255:
         raise PolicyError(400, "Bad target host")
+    literal = normalize_ipv4_literal(host)
+    if literal is not None:
+        host = literal
+        if is_blocked_ip(host) and not private_ok:
+            raise PolicyError(403, "Private or non-public address blocked")
     infos = _resolve_with_timeout(host, port)
     if not infos:
         raise UpstreamError("DNS resolution failed")
@@ -1109,8 +1167,7 @@ class CacheManager:
         filename = f"{key}-{secrets.token_hex(8)}"
         final = os.path.join(self.data_dir, filename)
         try:
-            with open(tmp_path, "rb") as handle:
-                os.fsync(handle.fileno())
+            _fsync_path(tmp_path)
             os.replace(tmp_path, final)
         except OSError as exc:
             LOG.warning("cache write failed: %s", exc)
@@ -1181,6 +1238,22 @@ class CacheManager:
             os.remove(os.path.join(self.data_dir, filename))
         except OSError:
             pass
+
+
+def _fsync_path(path: str) -> None:
+    """Force a finished temp file to disk.
+
+    os.fsync on a read-only handle raises Errno 9 on Windows, so the handle
+    has to be opened for write even though the bytes are already complete.
+    """
+    flags = os.O_RDWR
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
@@ -2128,18 +2201,7 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
     def process_request(self, request, client_address) -> None:
         if not self._sem.acquire(blocking=False):
-            try:
-                body = b"Too many connections"
-                message = (
-                    b"HTTP/1.1 503 Service Unavailable\r\n"
-                    b"Connection: close\r\n"
-                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
-                    b"\r\n" + body
-                )
-                request.sendall(message)
-            except Exception:
-                pass
-            request.close()
+            _reject_busy(request)
             return
         try:
             super().process_request(request, client_address)
@@ -2176,6 +2238,50 @@ def _validate_auth(raw: str) -> Tuple[str, str]:
         if any(ch.isspace() or ord(ch) < 32 for ch in value):
             raise SystemExit(f"--auth {label}不能包含空白或控制字符")
     return user, password
+
+
+def _reject_busy(request: socket.socket) -> None:
+    """Reply 503, then close without aborting the connection.
+
+    Windows sends RST if a socket is closed while the request is still unread,
+    so the client sees WinError 10053 instead of the status line.
+    """
+    try:
+        request.settimeout(1.0)
+        pending = b""
+        while b"\r\n\r\n" not in pending and len(pending) < 65536:
+            chunk = request.recv(4096)
+            if not chunk:
+                break
+            pending += chunk
+        body = b"Too many connections"
+        message = (
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Connection: close\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"\r\n" + body
+        )
+        request.sendall(message)
+        try:
+            request.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        request.close()
+
+
+def _prefer_utf8_stdio() -> None:
+    """Help and the banner are Chinese. A cp1252 console otherwise exits on --help."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2215,6 +2321,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    _prefer_utf8_stdio()
     configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)

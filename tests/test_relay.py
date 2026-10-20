@@ -257,7 +257,35 @@ def test_public_addresses_allowed(ip):
     assert not classrelay.is_blocked_ip(ip)
 
 
-def test_decimal_and_odd_literals_resolve_to_loopback():
+@pytest.mark.parametrize(
+    "host,ip",
+    [
+        ("2130706433", "127.0.0.1"),
+        ("0x7f000001", "127.0.0.1"),
+        ("0X7F000001", "127.0.0.1"),
+        ("127.1", "127.0.0.1"),
+        ("127.0.1", "127.0.0.1"),
+        ("0177.0.0.1", "127.0.0.1"),
+        ("0x7f.0.0.1", "127.0.0.1"),
+        ("134744072", "8.8.8.8"),
+        ("8.8.8.8", "8.8.8.8"),
+    ],
+)
+def test_ipv4_literal_normalization(host, ip):
+    assert classrelay.normalize_ipv4_literal(host) == ip
+
+
+@pytest.mark.parametrize("host", ["example.com", "localhost", "", "08", "999.1.1.1", "127.0.0.1.extra"])
+def test_non_ipv4_literals_stay_names(host):
+    assert classrelay.normalize_ipv4_literal(host) is None
+
+
+def test_decimal_and_odd_literals_resolve_to_loopback(monkeypatch):
+    def fake(host, port):
+        assert host == "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, port))]
+
+    monkeypatch.setattr(classrelay, "resolve_addresses", fake)
     for host in ("2130706433", "0x7f000001", "127.1"):
         infos = classrelay.resolve_destination(host, 80, private_ok=True)
         ips = {item[4][0].split("%", 1)[0] for item in infos}
@@ -1212,6 +1240,8 @@ def test_cli_help_stays_compatible():
         [sys.executable, str(Path(__file__).resolve().parents[1] / "classrelay.py"), "--help"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=20,
     )
     assert completed.returncode == 0
